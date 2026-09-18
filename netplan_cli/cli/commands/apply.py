@@ -23,6 +23,7 @@ import logging
 import os
 import sys
 import glob
+import hashlib
 import subprocess
 import shutil
 import time
@@ -36,6 +37,9 @@ from ..ovs import OvsDbServerNotRunning, OvsDbServerNotInstalled, apply_ovs_clea
 OVS_CLEANUP_SERVICE = 'netplan-ovs-cleanup.service'
 
 IF_NAMESIZE = 16
+
+
+NETWORKD_RUN_DIR = '/run/systemd/network'
 
 
 class NetplanApply(utils.NetplanCommand):
@@ -108,7 +112,8 @@ class NetplanApply(utils.NetplanCommand):
                 return
 
         ovs_cleanup_service = self.generator_late_dir + 'netplan-ovs-cleanup.service'
-        old_files_networkd = bool(glob.glob('/run/systemd/network/*netplan-*'))
+        old_files_networkd = bool(glob.glob(os.path.join(NETWORKD_RUN_DIR, '*netplan-*')))
+        old_networkd_config = NetplanApply.networkd_config_snapshot()
         old_ovs_glob = glob.glob(self.generator_late_dir + 'netplan-ovs-*')
         # Ignore netplan-ovs-cleanup.service, as it can always be there
         if ovs_cleanup_service in old_ovs_glob:
@@ -149,9 +154,16 @@ class NetplanApply(utils.NetplanCommand):
         # Ideally we should compare the content of the *netplan-* files before and
         # after generation to minimize the number of re-starts, but the conditions
         # above works too.
-        restart_networkd = bool(glob.glob('/run/systemd/network/*netplan-*'))
+        restart_networkd = bool(glob.glob(os.path.join(NETWORKD_RUN_DIR, '*netplan-*')))
         if not restart_networkd and old_files_networkd:
             restart_networkd = True
+        # Which generated networkd files this run changed, for the debug log below.
+        # Without our own generate run (netplan try revert) that is unknown: None
+        # keeps the old reconfigure-everything behaviour.
+        changed_stems = None
+        if run_generate:
+            changed_stems = NetplanApply.networkd_changed_stems(old_networkd_config,
+                                                                NetplanApply.networkd_config_snapshot())
         restart_ovs_glob = glob.glob(self.generator_late_dir + 'netplan-ovs-*')
         # Ignore netplan-ovs-cleanup.service, as it can always be there
         if ovs_cleanup_service in restart_ovs_glob:
@@ -281,8 +293,7 @@ class NetplanApply(utils.NetplanCommand):
             # Run 'systemctl start' command synchronously, to avoid race conditions
             # with 'oneshot' systemd service units, e.g. netplan-ovs-*.service.
             try:
-                utils.networkctl_reload()
-                utils.networkctl_reconfigure(utils.networkd_interfaces())
+                NetplanApply.reload_networkd(changed_stems)
             except subprocess.CalledProcessError:
                 # (re-)start systemd-networkd if it is not running, yet
                 logging.warning('Falling back to a hard restart of systemd-networkd.service')
@@ -357,6 +368,42 @@ class NetplanApply(utils.NetplanCommand):
                 logging.warning('Could not delete interface {}'.format(link))
 
         return dropped_interfaces
+
+    @staticmethod
+    def reload_networkd(changed_stems):
+        '''Make networkd pick up the generated files. 'networkctl reload' reconfigures
+        the links whose files changed, on the non-forced path that keeps the
+        addresses and routes the file still requests. A forced 'reconfigure' drops
+        and re-adds everything on a link, so it is only used when the change set
+        is unknown (None).'''
+        utils.networkctl_reload()
+        if changed_stems is None:
+            utils.networkctl_reconfigure(utils.networkd_interfaces())
+        else:
+            logging.debug('networkd config changed for: %s',
+                          sorted(os.path.basename(stem) for stem in changed_stems) or 'nothing')
+
+    @staticmethod
+    def networkd_config_snapshot():
+        '''Content hashes of the netplan-generated networkd files, keyed by path'''
+        snapshot = {}
+        for path in glob.glob(os.path.join(NETWORKD_RUN_DIR, '*netplan-*')):
+            if not os.path.isfile(path):
+                continue
+            try:
+                with open(path, 'rb') as f:
+                    snapshot[path] = hashlib.sha256(f.read()).hexdigest()
+            except OSError:
+                snapshot[path] = None
+        return snapshot
+
+    @staticmethod
+    def networkd_changed_stems(old, new):
+        '''Stems (path minus extension) of files that were added, removed or modified,
+        so a changed .netdev or .link also selects the matching .network'''
+        changed = {path for path in set(old) | set(new)
+                   if old.get(path) is None or new.get(path) is None or old[path] != new[path]}
+        return {os.path.splitext(path)[0] for path in changed}
 
     @staticmethod
     def process_link_changes(interfaces, config_manager: ConfigManager):  # pragma: nocover (covered in autopkgtest)

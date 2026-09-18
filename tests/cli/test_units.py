@@ -256,3 +256,86 @@ class TestCLI(unittest.TestCase):
         with patch.object(cmd, 'revert',
                           side_effect=FileNotFoundError(2, 'No such file', '/etc/netplan')):
             self.assertEqual(cmd._safe_revert("test reason"), 1)
+
+    def _write(self, directory, name, content):
+        path = os.path.join(directory, name)
+        with open(path, 'w') as f:
+            f.write(content)
+        return path
+
+    def test_networkd_config_snapshot_and_changed_stems(self):
+        with tempfile.TemporaryDirectory() as run_dir:
+            eth0 = self._write(run_dir, '10-netplan-eth0.network', '[Match]\nName=eth0\n')
+            self._write(run_dir, '10-netplan-bond0.netdev', '[NetDev]\nName=bond0\n')
+            self._write(run_dir, '10-netplan-bond0.network', '[Match]\nName=bond0\n')
+            self._write(run_dir, '99-other.network', '[Match]\nName=other\n')
+            os.mkdir(os.path.join(run_dir, '10-netplan-eth0.network.d'))
+            with patch('netplan_cli.cli.commands.apply.NETWORKD_RUN_DIR', run_dir):
+                before = NetplanApply.networkd_config_snapshot()
+                # only netplan files, no directories, no foreign files
+                self.assertEqual(set(before), {eth0,
+                                               os.path.join(run_dir, '10-netplan-bond0.netdev'),
+                                               os.path.join(run_dir, '10-netplan-bond0.network')})
+                # unchanged files produce no stems
+                self.assertEqual(NetplanApply.networkd_changed_stems(before, before), set())
+                # modify eth0, remove bond0's .netdev, add a new vlan
+                self._write(run_dir, '10-netplan-eth0.network', '[Match]\nName=eth0\n[Route]\nDestination=10.0.0.0/8\n')
+                os.remove(os.path.join(run_dir, '10-netplan-bond0.netdev'))
+                self._write(run_dir, '10-netplan-vlan10.network', '[Match]\nName=vlan10\n')
+                after = NetplanApply.networkd_config_snapshot()
+            self.assertEqual(NetplanApply.networkd_changed_stems(before, after),
+                             {os.path.join(run_dir, '10-netplan-eth0'),
+                              os.path.join(run_dir, '10-netplan-bond0'),
+                              os.path.join(run_dir, '10-netplan-vlan10')})
+
+    @patch('netplan_cli.cli.utils.networkd_interfaces', return_value={'2', '3'})
+    @patch('netplan_cli.cli.utils.networkctl_reconfigure')
+    @patch('netplan_cli.cli.utils.networkctl_reload')
+    def test_reload_networkd(self, reload, reconfigure, interfaces):
+        # nothing changed: reload only
+        NetplanApply.reload_networkd(set())
+        reload.assert_called_once_with()
+        reconfigure.assert_not_called()
+        # one file changed: still reload only, networkd reconfigures that link itself
+        reload.reset_mock()
+        NetplanApply.reload_networkd({'/run/systemd/network/10-netplan-eth1'})
+        reload.assert_called_once_with()
+        reconfigure.assert_not_called()
+        # unknown change set (apply without generate, netplan try revert): reconfigure everything
+        reload.reset_mock()
+        NetplanApply.reload_networkd(None)
+        reload.assert_called_once_with()
+        reconfigure.assert_called_once_with({'2', '3'})
+
+    @patch('netplan_cli.cli.utils.networkctl_reconfigure')
+    @patch('netplan_cli.cli.utils.networkctl_reload', side_effect=subprocess.CalledProcessError(1, 'networkctl'))
+    def test_reload_networkd_failure_propagates(self, reload, reconfigure):
+        # command_apply falls back to a hard networkd restart on this
+        with self.assertRaises(subprocess.CalledProcessError):
+            NetplanApply.reload_networkd(set())
+        reconfigure.assert_not_called()
+
+    def test_networkd_changed_stems_unreadable_counts_as_changed(self):
+        path = '/run/systemd/network/10-netplan-eth0.network'
+        self.assertEqual(NetplanApply.networkd_changed_stems({path: None}, {path: None}),
+                         {'/run/systemd/network/10-netplan-eth0'})
+        self.assertEqual(NetplanApply.networkd_changed_stems({path: 'abc'}, {path: None}),
+                         {'/run/systemd/network/10-netplan-eth0'})
+        self.assertEqual(NetplanApply.networkd_changed_stems({path: None}, {path: 'abc'}),
+                         {'/run/systemd/network/10-netplan-eth0'})
+
+    def test_networkd_config_snapshot_unreadable_file(self):
+        with tempfile.TemporaryDirectory() as run_dir:
+            denied = self._write(run_dir, '10-netplan-eth0.network', '[Match]\nName=eth0\n')
+            readable = self._write(run_dir, '10-netplan-eth1.network', '[Match]\nName=eth1\n')
+            real_open = open
+
+            def deny(*args, **kwargs):
+                if args and args[0] == denied:
+                    raise PermissionError
+                return real_open(*args, **kwargs)
+            with patch('netplan_cli.cli.commands.apply.NETWORKD_RUN_DIR', run_dir), \
+                    patch('builtins.open', side_effect=deny):
+                snapshot = NetplanApply.networkd_config_snapshot()
+        self.assertIsNone(snapshot[denied])
+        self.assertEqual(len(snapshot[readable]), 64)  # sha256 hex digest
